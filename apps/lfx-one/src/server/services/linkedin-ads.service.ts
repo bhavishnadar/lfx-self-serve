@@ -134,15 +134,16 @@ async function findByName(nestedPath: string, name: string): Promise<string | nu
       if (elements.length < pageSize) break;
       start += pageSize;
     }
-  } catch (err) {
-    logger.warning(undefined, 'linkedin_find_by_name', `Search failed for "${name}"`, {
-      error: err instanceof Error ? err.message : String(err),
-    });
+  } catch (error: unknown) {
+    logger.warning(undefined, 'linkedin_find_by_name', `Search failed for ${nestedPath}`, { name, err: error });
   }
   return null;
 }
 
 function toMs(dateStr: string, eod = false): number {
+  if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    throw new Error(`Invalid date format: expected YYYY-MM-DD, got "${dateStr}"`);
+  }
   const [y, m, d] = dateStr.split('-').map(Number);
   if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) {
     throw new Error(`Invalid date string: "${dateStr}" — expected YYYY-MM-DD`);
@@ -170,7 +171,7 @@ export async function verifyAccount(): Promise<{ name: string; status: string }>
   return { name: data.name || getAccountId(), status: data.status || 'UNKNOWN' };
 }
 
-export async function resolveGeoTargets(locationNames: string[]): Promise<LinkedInGeoTarget[]> {
+export async function resolveGeoTargets(locationNames: string[], req?: Request): Promise<LinkedInGeoTarget[]> {
   const resolved: LinkedInGeoTarget[] = [];
 
   for (const name of locationNames) {
@@ -194,8 +195,8 @@ export async function resolveGeoTargets(locationNames: string[]): Promise<Linked
           });
         }
       }
-    } catch {
-      logger.warning(undefined, 'linkedin_resolve_geo', `Failed to resolve geo: ${name}`, { name });
+    } catch (error: unknown) {
+      logger.warning(req, 'linkedin_resolve_geo', `Failed to resolve geo: ${name}`, { name, err: error });
     }
   }
 
@@ -296,9 +297,8 @@ export async function createDarkPost(introText: string, headline: string, destUr
   };
 
   const data = await linkedInRequest('POST', 'posts', body);
-  const id = data.id || '';
-  if (!id) throw new Error('LinkedIn API returned no ID for dark post');
-  return id;
+  if (!data.id) throw new Error('LinkedIn dark post creation succeeded but returned no ID');
+  return data.id;
 }
 
 export async function createCreative(campaignId: string, shareUrn: string, adName: string): Promise<string> {
@@ -310,9 +310,8 @@ export async function createCreative(campaignId: string, shareUrn: string, adNam
   };
 
   const data = await linkedInRequest('POST', `adAccounts/${getAccountId()}/creatives`, body);
-  const id = data.id || '';
-  if (!id) throw new Error('LinkedIn API returned no ID for creative');
-  return id;
+  if (!data.id) throw new Error('LinkedIn creative creation succeeded but returned no ID');
+  return data.id;
 }
 
 export function buildTargetingCriteria(profile: LinkedInTargetingProfile, geoUrns: string[]): Record<string, unknown> {
@@ -375,6 +374,12 @@ export async function executeLinkedInCampaignCreation(req: Request | undefined, 
   const steps: string[] = [];
   const startTime = logger.startOperation(req, 'linkedin_campaign_create', { event: params.eventName });
 
+  if (params.endDate <= params.startDate) {
+    const err = new Error(`Invalid date range: endDate (${params.endDate}) must be after startDate (${params.startDate})`);
+    logger.error(req, 'linkedin_campaign_create', startTime, err, { startDate: params.startDate, endDate: params.endDate });
+    throw err;
+  }
+
   try {
     const account = await verifyAccount();
     steps.push(`Verified account: ${account.name} (${account.status})`);
@@ -417,13 +422,13 @@ export async function executeLinkedInCampaignCreation(req: Request | undefined, 
       campaignName,
       campaignId,
       creativeCount,
-      linkedInUrl: `https://www.linkedin.com/campaignmanager/accounts/${getAccountId()}/campaigns/${campaignId}`,
+      campaignUrl: `https://www.linkedin.com/campaignmanager/accounts/${getAccountId()}/campaigns/${campaignId}`,
       steps,
     };
 
     logger.success(req, 'linkedin_campaign_create', startTime, { campaignId, creativeCount });
     return result;
-  } catch (error) {
+  } catch (error: unknown) {
     logger.error(req, 'linkedin_campaign_create', startTime, error, { event: params.eventName });
     throw error;
   }
