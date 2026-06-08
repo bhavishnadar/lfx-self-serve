@@ -1,7 +1,7 @@
 // Copyright The Linux Foundation and each contributor to LFX.
 // SPDX-License-Identifier: MIT
 
-import { Component, computed, inject, signal, Signal } from '@angular/core';
+import { Component, computed, inject, signal, Signal, WritableSignal } from '@angular/core';
 import { takeUntilDestroyed, toObservable, toSignal } from '@angular/core/rxjs-interop';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, Router } from '@angular/router';
@@ -12,7 +12,6 @@ import { catchError, combineLatest, debounceTime, distinctUntilChanged, filter, 
 
 import { CardComponent } from '@components/card/card.component';
 import { CardTabsBarComponent } from '@components/card-tabs-bar/card-tabs-bar.component';
-import { EmptyStateComponent } from '@components/empty-state/empty-state.component';
 import {
   DEFAULT_EVENTS_PAGE_SIZE,
   DEFAULT_ORG_EVENTS_TAB_ID,
@@ -37,7 +36,7 @@ import { EventsService } from '@services/events.service';
 import { DiscoverEventsButtonComponent } from '../components/discover-events-button/discover-events-button.component';
 import { EventAttendeesDrawerComponent } from './components/event-attendees-drawer/event-attendees-drawer.component';
 import { EventSpeakersDrawerComponent } from './components/event-speakers-drawer/event-speakers-drawer.component';
-import { OrgUpcomingEventsTableComponent } from './components/org-upcoming-events-table/org-upcoming-events-table.component';
+import { OrgEventsTableComponent } from './components/org-events-table/org-events-table.component';
 
 @Component({
   selector: 'lfx-org-events-dashboard',
@@ -45,13 +44,12 @@ import { OrgUpcomingEventsTableComponent } from './components/org-upcoming-event
     FormsModule,
     CardComponent,
     CardTabsBarComponent,
-    EmptyStateComponent,
     SelectModule,
     InputTextModule,
     DiscoverEventsButtonComponent,
     EventAttendeesDrawerComponent,
     EventSpeakersDrawerComponent,
-    OrgUpcomingEventsTableComponent,
+    OrgEventsTableComponent,
   ],
   templateUrl: './org-events-dashboard.component.html',
 })
@@ -76,6 +74,10 @@ export class OrgEventsDashboardComponent {
   public readonly upcomingEventsPage = signal<PageChangeEvent>({ offset: 0, pageSize: DEFAULT_EVENTS_PAGE_SIZE });
   public readonly upcomingSortField = signal('EVENT_START_DATE');
   public readonly upcomingSortOrder = signal<'ASC' | 'DESC'>('ASC');
+  public readonly pastEventsLoading = signal(true);
+  public readonly pastEventsPage = signal<PageChangeEvent>({ offset: 0, pageSize: DEFAULT_EVENTS_PAGE_SIZE });
+  public readonly pastSortField = signal('EVENT_START_DATE');
+  public readonly pastSortOrder = signal<'ASC' | 'DESC'>('DESC');
 
   // === Computed / toSignal ===
   // Debounced search feeds the server-side query so typing doesn't fire a request per keystroke.
@@ -83,7 +85,24 @@ export class OrgEventsDashboardComponent {
   public readonly companyName = computed(() => this.accountContext.selectedAccount().accountName ?? '');
   public readonly activeTab: Signal<OrgEventsTabId> = this.initActiveTab();
   public readonly eventsSummary: Signal<OrgEventsSummary | null> = this.initEventsSummary();
-  public readonly upcomingEvents: Signal<OrgEventsResponse> = this.initUpcomingEvents();
+  public readonly upcomingEvents: Signal<OrgEventsResponse> = this.initEventsPipeline({
+    tab: 'upcoming',
+    page: this.upcomingEventsPage,
+    sortField: this.upcomingSortField,
+    sortOrder: this.upcomingSortOrder,
+    loading: this.upcomingEventsLoading,
+    isPast: false,
+    errorDetail: 'Failed to load upcoming events. Please try again.',
+  });
+  public readonly pastEvents: Signal<OrgEventsResponse> = this.initEventsPipeline({
+    tab: 'past',
+    page: this.pastEventsPage,
+    sortField: this.pastSortField,
+    sortOrder: this.pastSortOrder,
+    loading: this.pastEventsLoading,
+    isPast: true,
+    errorDetail: 'Failed to load past events. Please try again.',
+  });
   public readonly tabPillOptions = computed<FilterPillOption[]>(() => {
     const summary = this.eventsSummary();
     return ORG_EVENTS_TABS.map((tab) => {
@@ -100,6 +119,7 @@ export class OrgEventsDashboardComponent {
       .pipe(skip(1), takeUntilDestroyed())
       .subscribe(() => {
         this.upcomingEventsPage.set({ offset: 0, pageSize: this.upcomingEventsPage().pageSize });
+        this.pastEventsPage.set({ offset: 0, pageSize: this.pastEventsPage().pageSize });
       });
   }
 
@@ -151,6 +171,21 @@ export class OrgEventsDashboardComponent {
     this.upcomingEventsPage.set({ offset: 0, pageSize: this.upcomingEventsPage().pageSize });
   }
 
+  public onPastPageChange(event: PageChangeEvent): void {
+    this.pastEventsLoading.set(true);
+    this.pastEventsPage.set(event);
+  }
+
+  public onPastSortChange(event: SortChangeEvent): void {
+    if (this.pastSortField() === event.field) {
+      this.pastSortOrder.set(this.pastSortOrder() === 'ASC' ? 'DESC' : 'ASC');
+    } else {
+      this.pastSortField.set(event.field);
+      this.pastSortOrder.set('ASC');
+    }
+    this.pastEventsPage.set({ offset: 0, pageSize: this.pastEventsPage().pageSize });
+  }
+
   // === Private initializers ===
   private initActiveTab(): Signal<OrgEventsTabId> {
     const queryParamMap = toSignal(this.route.queryParamMap, {
@@ -173,37 +208,48 @@ export class OrgEventsDashboardComponent {
     );
   }
 
-  private initUpcomingEvents(): Signal<OrgEventsResponse> {
+  // Shared events query pipeline for both tabs; only the active tab fetches, the inactive tab keeps its last value.
+  private initEventsPipeline(opts: {
+    tab: OrgEventsTabId;
+    page: Signal<PageChangeEvent>;
+    sortField: Signal<string>;
+    sortOrder: Signal<'ASC' | 'DESC'>;
+    loading: WritableSignal<boolean>;
+    isPast: boolean;
+    errorDetail: string;
+  }): Signal<OrgEventsResponse> {
+    const { tab, page, sortField, sortOrder, loading, isPast, errorDetail } = opts;
     return toSignal(
       toObservable(
         computed(() => {
+          if (this.activeTab() !== tab) return null;
           const accountId = this.accountContext.selectedAccount().accountId;
           if (!accountId) return null;
           return {
             accountId,
-            ...this.upcomingEventsPage(),
+            ...page(),
             searchQuery: this.debouncedSearchTerm() || undefined,
             status: this.selectedStatus() ?? null,
-            sortField: this.upcomingSortField(),
-            sortOrder: this.upcomingSortOrder(),
+            sortField: sortField(),
+            sortOrder: sortOrder(),
           };
         })
       ).pipe(
         debounceTime(0),
         filter((params): params is NonNullable<typeof params> => params !== null),
-        tap(() => this.upcomingEventsLoading.set(true)),
+        tap(() => loading.set(true)),
         switchMap(({ accountId, ...params }) =>
-          this.eventsService.getOrgEvents(accountId, { ...params, isPast: false }).pipe(
+          this.eventsService.getOrgEvents(accountId, { ...params, isPast }).pipe(
             catchError(() => {
               this.messageService.add({
                 severity: 'error',
                 summary: 'Error',
-                detail: 'Failed to load upcoming events. Please try again.',
+                detail: errorDetail,
               });
-              const { pageSize, offset } = this.upcomingEventsPage();
+              const { pageSize, offset } = page();
               return of({ ...EMPTY_ORG_EVENTS_RESPONSE, pageSize, offset });
             }),
-            finalize(() => this.upcomingEventsLoading.set(false))
+            finalize(() => loading.set(false))
           )
         )
       ),
