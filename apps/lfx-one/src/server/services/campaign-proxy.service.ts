@@ -6,6 +6,7 @@ import { AI_MODEL } from '@lfx-one/shared/constants';
 import type {
   BulkKeywordActionRequest,
   BulkKeywordActionResponse,
+  CampaignBriefRefineRequest,
   CampaignBriefRequest,
   CampaignCreateRequest,
   CampaignCreateResponse,
@@ -288,10 +289,12 @@ async function resolveHubSpotUtm(eventName: string): Promise<string | null> {
 // AI service helpers (LiteLLM proxy — same pattern as ai.service.ts)
 // ---------------------------------------------------------------------------
 
-async function aiChat(systemPrompt: string, userPrompt: string, maxTokens = 4096): Promise<string> {
+async function aiChat(systemPrompt: string, userPrompt: string, externalSignal?: AbortSignal, maxTokens = 4096): Promise<string> {
   const aiProxyUrl = getEnv('AI_PROXY_URL');
   const aiApiKey = getEnv('AI_API_KEY');
   if (!aiProxyUrl || !aiApiKey) throw new Error('AI_PROXY_URL and AI_API_KEY required');
+
+  const signal = externalSignal ? AbortSignal.any([externalSignal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000);
 
   const response = await fetch(aiProxyUrl, {
     method: 'POST',
@@ -308,7 +311,7 @@ async function aiChat(systemPrompt: string, userPrompt: string, maxTokens = 4096
       max_tokens: maxTokens,
       temperature: 0.7,
     }),
-    signal: AbortSignal.timeout(30_000),
+    signal,
   });
 
   if (!response.ok) {
@@ -621,14 +624,7 @@ export class CampaignProxyService {
       yield { type: 'copy_done', data: null };
 
       try {
-        let text = fullCopy.trim();
-        if (text.startsWith('```')) {
-          const firstNewline = text.indexOf('\n');
-          if (firstNewline !== -1) text = text.slice(firstNewline + 1);
-          const lastFence = text.lastIndexOf('```');
-          if (lastFence !== -1) text = text.slice(0, lastFence);
-          text = text.trim();
-        }
+        const text = stripJsonFences(fullCopy);
         const structured = JSON.parse(text) as Record<string, unknown>;
 
         truncateAdCopy(structured);
@@ -647,14 +643,7 @@ export class CampaignProxyService {
 
       try {
         const kwPrompt = buildKeywordPrompt(body, eventDetails);
-        let kwText = (await aiChat(KEYWORD_SYSTEM_PROMPT, kwPrompt)).trim();
-        if (kwText.startsWith('```')) {
-          const firstNl = kwText.indexOf('\n');
-          if (firstNl !== -1) kwText = kwText.slice(firstNl + 1);
-          const lastFence = kwText.lastIndexOf('```');
-          if (lastFence !== -1) kwText = kwText.slice(0, lastFence);
-          kwText = kwText.trim();
-        }
+        const kwText = stripJsonFences(await aiChat(KEYWORD_SYSTEM_PROMPT, kwPrompt));
         let kwList = JSON.parse(kwText);
         if (kwList && typeof kwList === 'object' && !Array.isArray(kwList) && Array.isArray(kwList.keywords)) {
           kwList = kwList.keywords;
@@ -669,6 +658,75 @@ export class CampaignProxyService {
       } catch (error) {
         logger.warning(req, 'campaign_brief_keywords', 'Keyword generation failed', { err: error });
         yield { type: 'status', data: 'Keyword generation failed, skipping...' };
+      }
+    }
+
+    yield { type: 'done', data: null };
+  }
+
+  // === Brief refinement (SSE stream) ===
+
+  public async *streamRefinedBrief(
+    req: Request,
+    body: CampaignBriefRefineRequest,
+    signal: AbortSignal
+  ): AsyncGenerator<{ type: CampaignSSEEventType; data: unknown }> {
+    checkRequiredEnv(req);
+
+    const unsupported = (body.platforms ?? []).filter((p) => p !== 'google-ads');
+    if (unsupported.length > 0) {
+      yield { type: 'error', data: `Unsupported platforms: ${unsupported.join(', ')}. Only google-ads is currently supported.` };
+      return;
+    }
+
+    yield { type: 'status', data: 'Refining brief based on your feedback...' };
+
+    const userPrompt = buildRefinePrompt(body);
+    let fullCopy = '';
+
+    try {
+      for await (const token of aiChatStream(COPY_SYSTEM_PROMPT, userPrompt, signal)) {
+        yield { type: 'copy_token', data: token };
+        fullCopy += token;
+      }
+      yield { type: 'copy_done', data: null };
+
+      try {
+        const text = stripJsonFences(fullCopy);
+        const structured = JSON.parse(text) as Record<string, unknown>;
+        truncateAdCopy(structured);
+        yield { type: 'copy_structured', data: structured };
+      } catch {
+        yield { type: 'copy_structured', data: { raw: fullCopy } };
+      }
+    } catch (error) {
+      if (signal.aborted) return;
+      yield { type: 'error', data: `Brief refinement failed: ${error instanceof Error ? error.message : 'Unknown error'}` };
+      return;
+    }
+
+    const platforms = body.platforms || ['google-ads'];
+    if (platforms.includes('google-ads')) {
+      yield { type: 'status', data: 'Regenerating keywords...' };
+
+      try {
+        const kwPrompt = buildRefineKeywordPrompt(body);
+        const kwText = stripJsonFences(await aiChat(KEYWORD_SYSTEM_PROMPT, kwPrompt, signal));
+        let kwList = JSON.parse(kwText);
+        if (kwList && typeof kwList === 'object' && !Array.isArray(kwList) && Array.isArray(kwList.keywords)) {
+          kwList = kwList.keywords;
+        }
+        const keywords = (kwList as Record<string, string>[]).map((k) => ({
+          term: k['term'] || k['keyword'] || '',
+          matchType: k['match_type'] || k['matchType'] || 'Broad',
+          intentLevel: k['intent_level'] || k['intentLevel'] || 'Medium',
+          notes: k['notes'] || '',
+        }));
+        yield { type: 'keywords', data: keywords };
+      } catch (error) {
+        if (signal.aborted) return;
+        logger.warning(req, 'campaign_refine_keywords', 'Keyword regeneration failed', { err: error });
+        yield { type: 'status', data: 'Keyword regeneration failed, keeping existing keywords...' };
       }
     }
 
@@ -1018,6 +1076,15 @@ export class CampaignProxyService {
 // Helpers
 // ---------------------------------------------------------------------------
 
+function stripJsonFences(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('```')) return trimmed;
+  const firstNewline = trimmed.indexOf('\n');
+  const inner = firstNewline !== -1 ? trimmed.slice(firstNewline + 1) : trimmed;
+  const lastFence = inner.lastIndexOf('```');
+  return (lastFence !== -1 ? inner.slice(0, lastFence) : inner).trim();
+}
+
 function resolveMatchType(matchType: string): number {
   const normalized = matchType.toLowerCase();
   if (normalized === 'exact') return enums.KeywordMatchType.EXACT;
@@ -1149,6 +1216,43 @@ CRITICAL RULES:
 - The event year is ${eventYear}. NEVER use any other year in keywords.
 - Prefer HIGH INTENT — keywords that indicate someone actively searching for this event.
 - Avoid generic broad terms that waste budget (e.g. "conference" alone).`;
+}
+
+function buildRefinePrompt(body: CampaignBriefRefineRequest): string {
+  const eventBlock = body.eventDetails ? `\nEVENT: ${body.eventDetails.name}\nDates: ${body.eventDetails.dates}\nCity: ${body.eventDetails.city}\n` : '';
+
+  return `I have existing Google Ads copy that needs refinement based on user feedback.
+
+CURRENT AD COPY:
+${JSON.stringify(body.currentCopy, null, 2)}
+${eventBlock}
+USER FEEDBACK:
+${body.feedback}
+
+Please regenerate the ad copy incorporating the user's feedback while maintaining the same JSON structure.
+Respect all character limits from the system prompt. Return the same JSON format with keys "google_search" and "google_display".`;
+}
+
+function buildRefineKeywordPrompt(body: CampaignBriefRefineRequest): string {
+  const currentKws = (body.currentKeywords ?? []).map((kw) => kw.term).join(', ');
+  const eventName = body.eventDetails?.name || '';
+
+  return `Regenerate keywords for this event based on user feedback.
+
+EVENT: ${eventName}
+CURRENT KEYWORDS: ${currentKws}
+
+USER FEEDBACK: ${body.feedback}
+
+Based on the feedback, generate 25-40 refined Google Search keywords.
+
+Return a JSON array where each object has EXACTLY these keys:
+- "term": the keyword string
+- "match_type": "Exact", "Phrase", or "Broad"
+- "intent_level": "High" (direct event search), "Medium" (related topic), "Low" (broad)
+- "notes": any flag (e.g. "added per user feedback")
+
+Prefer HIGH INTENT keywords. Incorporate the user's feedback to improve the keyword list.`;
 }
 
 const REGION_MAP: Record<string, string> = {
