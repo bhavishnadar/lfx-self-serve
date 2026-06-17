@@ -102,8 +102,8 @@ export * from './sse.interface';
 // Copilot interfaces
 export * from './copilot.interface';
 
-// OSSPREY admin dashboard interfaces
-export * from './ossprey.interface';
+// Akrites admin dashboard interfaces
+export * from './akrites.interface';
 
 // Committee application interfaces
 export * from './committee-application.interface';
