@@ -425,4 +425,35 @@ export interface AkritesActivityDayGroup {
   rows: AkritesActivityRowVM[];
 }
 
-export type AkritesDashboardTab = 'overview' | 'packages';
+export type AkritesDashboardTab = 'overview' | 'packages' | 'triage';
+
+// ===== Triage Board =====
+
+export type AkritesTriageStatus = Extract<AkritesStatus, 'unassigned' | 'needs_attention' | 'escalated' | 'blocked' | 'inactive'>;
+
+export interface AkritesTriageBoardColumnConfig {
+  status: AkritesTriageStatus;
+  label: string;
+  /** Hex color for the column icon circle and gradient tint. */
+  color: string;
+  /** Pre-computed FontAwesome class string bound directly in the template. */
+  iconClass: string;
+  actionLabel: string;
+  actionVariant: 'blue' | 'red' | 'default';
+  /** Pre-computed Tailwind class string for the action button. */
+  actionButtonClass: string;
+}
+
+/** `AkritesPackage` extended with pre-computed display values to avoid method calls in bindings. */
+export interface AkritesTriagePackageVM extends AkritesPackage {
+  healthColor: string;
+  healthLabel: string;
+  vulnColor: string;
+}
+
+export interface AkritesTriageColumnState {
+  packages: AkritesTriagePackageVM[];
+  total: number;
+  loading: boolean;
+  error: boolean;
+}
