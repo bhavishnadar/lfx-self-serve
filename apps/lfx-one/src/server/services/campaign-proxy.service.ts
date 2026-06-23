@@ -16,6 +16,8 @@ import type {
   CampaignPlatform,
   CampaignProgramType,
   CampaignSSEEventType,
+  CampaignStatusUpdateRequest,
+  CampaignStatusUpdateResult,
   KeywordActionResponse,
   LinkedInCampaignCreateResult,
   MetaCampaignCreateResult,
@@ -26,7 +28,7 @@ import type { Request } from 'express';
 import { validateScrapeUrl, fetchSafeUrl } from '../helpers/url-validation';
 import { executeLinkedInCampaignCreation, resolveGeoTargets } from './linkedin-ads.service';
 import { logger } from './logger.service';
-import { executeMetaCampaignCreation } from './meta-ads.service';
+import { executeMetaCampaignCreation, updateMetaCampaignStatus } from './meta-ads.service';
 import { executeRedditCampaignCreation } from './reddit-ads.service';
 
 // ---------------------------------------------------------------------------
@@ -640,6 +642,7 @@ export class CampaignProxyService {
       try {
         const extraction = await aiChat(getExtractionPrompt(body.programType), `URL: ${body.url}\n\nHTML:\n${html.slice(0, 30_000)}`);
         eventDetails = JSON.parse(extraction) as Record<string, unknown>;
+        // Education extraction also yields price, certification_code, prerequisites — deferred until CampaignEventDetails supports them
         yield {
           type: 'event',
           data: {
@@ -940,6 +943,21 @@ export class CampaignProxyService {
       failed: results.length - succeeded,
       results,
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Campaign Status Toggle
+  // ---------------------------------------------------------------------------
+
+  public async updateCampaignStatus(req: Request, campaignId: string, body: CampaignStatusUpdateRequest): Promise<CampaignStatusUpdateResult> {
+    const { platform, status } = body;
+
+    switch (platform) {
+      case 'meta-ads':
+        return updateMetaCampaignStatus(req, campaignId, status);
+      default:
+        throw new Error(`Status toggle is not supported for platform: ${platform}`);
+    }
   }
 
   // === Private: campaign creation orchestration ===
